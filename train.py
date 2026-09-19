@@ -66,8 +66,12 @@ def main():  # 主流程
     parser = argparse.ArgumentParser(description="预训练 mimi_gpt")  # 命令行入口
     parser.add_argument("--small", action="store_true", help="使用 CPU 冒烟配置")  # 开关：小配置
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="计算设备")  # 默认自动选
+    parser.add_argument("--batch_size", type=int, default=None, help="覆盖配置中的 batch_size")  # 显存不够或排查 GPU 兼容性时用
     args = parser.parse_args()  # 解析参数
     cfg = CONFIGS["small" if args.small else "default"]  # 选定超参数组
+    if args.batch_size is not None:  # 命令行显式指定了 batch_size 时覆盖默认值
+        cfg = dict(cfg)  # 复制一份再改，避免污染全局配置字典
+        cfg["batch_size"] = args.batch_size  # 应用覆盖值
     device = args.device  # 计算设备
     torch.manual_seed(1337)  # 固定随机种子，保证可复现
 

@@ -23,13 +23,30 @@ class GPTConfig:  # 模型超参数配置
     dropout: float = 0.1  # dropout 比例
 
 
+class MatmulLinear(nn.Module):  # 用普通矩阵乘实现的全连接层（等价于 nn.Linear）
+    """前向用 x @ W^T（matmul）实现，绕开 nn.Linear 内部的 addmm/cuBLASLt 内核路径——
+    该路径在部分 RTX 4090 + torch 2.7+cu128 组合的大形状下会输出 NaN。"""
+
+    def __init__(self, in_features, out_features, bias=True):  # 输入/输出维度；是否带偏置
+        super().__init__()  # 调用父类构造函数
+        self.weight = nn.Parameter(torch.empty(out_features, in_features))  # 权重矩阵（形状与 nn.Linear 一致，不影响权重绑定）
+        nn.init.normal_(self.weight, mean=0.0, std=0.02)  # 与原 nn.Linear 相同的正态初始化
+        self.bias = nn.Parameter(torch.zeros(out_features)) if bias else None  # 偏置（bias=False 时不创建）
+
+    def forward(self, x):  # x: (..., in_features)，支持任意 batch 维度
+        out = x @ self.weight.t()  # 普通矩阵乘：3D @ 2D 自动折叠为经典 cuBLAS mm 路径（已在本机验证无 NaN）
+        if self.bias is not None:  # 有偏置则广播加上
+            out = out + self.bias  # 加偏置
+        return out  # (..., out_features)
+
+
 class CausalSelfAttention(nn.Module):  # 因果多头自注意力（只能看前文，不能看未来）
     def __init__(self, config):  # 传入模型配置
         super().__init__()  # 调用父类构造函数
         assert config.n_embd % config.n_head == 0, "n_embd必须能被n_head整除"  # 保证每个头的维度是整数
         self.n_head = config.n_head  # 保存头数
-        self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd)  # 一个线性层同时算出 Q/K/V 三份投影
-        self.proj = nn.Linear(config.n_embd, config.n_embd)  # 注意力输出投影
+        self.qkv = MatmulLinear(config.n_embd, 3 * config.n_embd)  # 一个线性层同时算出 Q/K/V 三份投影
+        self.proj = MatmulLinear(config.n_embd, config.n_embd)  # 注意力输出投影
         self.attn_dropout = nn.Dropout(config.dropout)  # 注意力权重上的 dropout
         self.resid_dropout = nn.Dropout(config.dropout)  # 输出投影后的 dropout
         mask = torch.tril(torch.ones(config.block_size, config.block_size))  # 下三角矩阵：位置 i 只允许看到 <= i 的位置
@@ -53,8 +70,8 @@ class CausalSelfAttention(nn.Module):  # 因果多头自注意力（只能看前
 class MLP(nn.Module):  # 位置前馈网络
     def __init__(self, config):  # 传入模型配置
         super().__init__()  # 调用父类构造函数
-        self.fc = nn.Linear(config.n_embd, 4 * config.n_embd)  # 第一层：升维 4 倍
-        self.proj = nn.Linear(4 * config.n_embd, config.n_embd)  # 第二层：降回原维度
+        self.fc = MatmulLinear(config.n_embd, 4 * config.n_embd)  # 第一层：升维 4 倍
+        self.proj = MatmulLinear(4 * config.n_embd, config.n_embd)  # 第二层：降回原维度
         self.dropout = nn.Dropout(config.dropout)  # 输出 dropout
 
     def forward(self, x):  # x: (batch, seq_len, n_embd)
@@ -84,7 +101,7 @@ class GPT(nn.Module):  # 完整 GPT 模型
         self.drop = nn.Dropout(config.dropout)  # 嵌入后的 dropout
         self.blocks = nn.ModuleList([Block(config) for _ in range(config.n_layer)])  # 堆叠 N 个 Transformer 块
         self.ln_f = nn.LayerNorm(config.n_embd)  # 最后的层归一化
-        self.head = nn.Linear(config.n_embd, config.vocab_size, bias=False)  # 输出投影到词表
+        self.head = MatmulLinear(config.n_embd, config.vocab_size, bias=False)  # 输出投影到词表（matmul 实现，理由同上）
         self.head.weight = self.wte.weight  # 权重绑定：输入嵌入与输出投影共享同一矩阵，省参数且小模型上更稳
         self.apply(self._init_weights)  # 递归初始化所有子模块
         for pn, p in self.named_parameters():  # 遍历所有参数
@@ -92,7 +109,7 @@ class GPT(nn.Module):  # 完整 GPT 模型
                 nn.init.normal_(p, mean=0.0, std=0.02 / math.sqrt(2 * config.n_layer))  # 按深度缩小初始化方差，稳定深层训练（nanoGPT 技巧）
 
     def _init_weights(self, module):  # 默认初始化规则
-        if isinstance(module, nn.Linear):  # 线性层
+        if isinstance(module, (nn.Linear, MatmulLinear)):  # 线性层（含 matmul 实现）
             nn.init.normal_(module.weight, mean=0.0, std=0.02)  # 权重用 N(0, 0.02) 正态初始化
             if module.bias is not None:  # 若有偏置
                 nn.init.zeros_(module.bias)  # 偏置置零
