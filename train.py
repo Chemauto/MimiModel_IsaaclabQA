@@ -11,8 +11,12 @@ import math  # 数学库，用于余弦学习率调度
 import os  # 系统接口，用于拼接路径、创建目录
 import time  # 时间库，用于打印训练速度
 
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")  # 必须在 import torch 之前设置：固定 cuBLAS 工作区，配合下行确定性模式改变内核算法选择
+
 import numpy as np  # 读取 uint16 token 二进制文件
 import torch  # PyTorch 核心库
+
+torch.use_deterministic_algorithms(True, warn_only=True)  # 优先选用确定性 CUDA 内核：换掉按形状/负载自动挑选的默认算法，规避其中可能输出 NaN 的实现（warn_only 保证不支持的算子只警告不报错）
 from model import GPT, GPTConfig  # 导入模型定义
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # 脚本所在目录（mimi_gpt/）
