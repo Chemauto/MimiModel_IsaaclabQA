@@ -30,8 +30,10 @@ class CausalSelfAttention(nn.Module):  # 因果多头自注意力（只能看前
         self.n_head = config.n_head  # 保存头数
         self.qkv = nn.Linear(config.n_embd, 3 * config.n_embd)  # 一个线性层同时算出 Q/K/V 三份投影
         self.proj = nn.Linear(config.n_embd, config.n_embd)  # 注意力输出投影
-        self.attn_dropout = config.dropout  # 注意力权重上的 dropout 概率（传给 SDPA 内核）
+        self.attn_dropout = nn.Dropout(config.dropout)  # 注意力权重上的 dropout
         self.resid_dropout = nn.Dropout(config.dropout)  # 输出投影后的 dropout
+        mask = torch.tril(torch.ones(config.block_size, config.block_size))  # 下三角矩阵：位置 i 只允许看到 <= i 的位置
+        self.register_buffer("mask", mask.view(1, 1, config.block_size, config.block_size))  # 注册为 buffer：不参与训练，随模型一起保存
 
     def forward(self, x):  # x: (batch, seq_len, n_embd)
         B, T, C = x.shape  # 批大小、序列长度、模型维度
@@ -39,7 +41,11 @@ class CausalSelfAttention(nn.Module):  # 因果多头自注意力（只能看前
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # Q 重排为多头 (B, n_head, T, head_dim)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # K 同上
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # V 同上
-        y = F.scaled_dot_product_attention(q, k, v, dropout_p=self.attn_dropout if self.training else 0.0, is_causal=True)  # PyTorch 融合注意力内核：因果掩码 + 缩放点积（自动用 Flash Attention）
+        att = (q @ k.transpose(-2, -1)) / math.sqrt(k.size(-1))  # 缩放点积注意力分数 (B, n_head, T, T)
+        att = att.masked_fill(self.mask[:, :, :T, :T] == 0, float("-inf"))  # 掩掉上三角（未来位置），softmax 后这些位置权重为 0
+        att = F.softmax(att, dim=-1)  # 沿最后一维归一化成注意力权重
+        att = self.attn_dropout(att)  # 注意力权重 dropout
+        y = att @ v  # 按注意力权重对 V 加权求和 (B, n_head, T, head_dim)
         y = y.transpose(1, 2).contiguous().view(B, T, C)  # 合并多头回 (B, T, C)
         return self.resid_dropout(self.proj(y))  # 输出投影 + dropout
 
