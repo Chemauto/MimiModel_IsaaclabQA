@@ -1,6 +1,6 @@
 # mimi_gpt 🤖
 
-参考 [nanoGPT](./ref/nanoGPT) 的极简 GPT 实现（代码量约 1/3），用 TinyStories 数据集训练一个会续写英文小故事的迷你语言模型，完整走一遍「数据准备 → 预训练 → 采样」流程。
+极简 GPT 实现，用 TinyStories 数据集训练一个会续写英文小故事的迷你语言模型，完整走一遍「数据准备 → 预训练 → 采样」流程。
 
 ## 环境依赖
 
@@ -20,8 +20,9 @@ python prepare_data.py --max_train_stories 2000 --max_val_stories 200      # CPU
 **2. 训练**
 
 ```bash
-python train.py            # 默认配置，约 10M 参数，适合 GPU 机器
+python train.py            # 默认配置，约 10M 参数，GPU 上自动使用 bf16 混合精度（nanoGPT 同款）
 python train.py --small    # 冒烟配置，约 1M 参数，CPU 几分钟可见 loss 明显下降
+python train.py --dtype fp32    # 强制纯 fp32 训练
 ```
 
 **3. 续写故事**

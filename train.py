@@ -51,15 +51,16 @@ def get_batch(split_data, block_size, batch_size, device):  # 从一份 token �
 
 
 @torch.no_grad()  # 评估阶段不需要梯度
-def estimate_loss(model, data_dict, cfg, device):  # 在训练/验证集上各采样若干批，估计平均 loss
-    """返回 {"train": ..., "val": ...} 的平均损失字典。"""
+def estimate_loss(model, data_dict, cfg, device, autocast_ctx):  # 在训练/验证集上各采样若干批，估计平均 loss
+    """返回 {"train": ..., "val": ...} 的平均损失字典（与训练同精度）。"""
     model.eval()  # 切到评估模式（关闭 dropout）
     out = {}  # 结果容器
     for split, data in data_dict.items():  # 遍历训练集和验证集
         losses = torch.zeros(cfg["eval_iters"])  # 每批的 loss 存入该张量
         for k in range(cfg["eval_iters"]):  # 取多批求平均，降低随机波动
             X, Y = get_batch(data, cfg["block_size"], cfg["batch_size"], device)  # 取一批数据
-            _, loss = model(X, Y)  # 前向计算损失
+            with autocast_ctx:  # 与训练保持同一精度，评估值才有可比性
+                _, loss = model(X, Y)  # 前向计算损失
             losses[k] = loss.item()  # 记录该批 loss
         out[split] = losses.mean().item()  # 平均后保存
     model.train()  # 切回训练模式（恢复 dropout）
@@ -71,17 +72,19 @@ def main():  # 主流程
     parser.add_argument("--small", action="store_true", help="使用 CPU 冒烟配置")  # 开关：小配置
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="计算设备")  # 默认自动选
     parser.add_argument("--batch_size", type=int, default=None, help="覆盖配置中的 batch_size")  # 显存不够或排查 GPU 兼容性时用
+    parser.add_argument("--dtype", type=str, default="auto", choices=["auto", "bf16", "fp32"], help="训练精度：auto 在 GPU 上用 bf16 混合精度，CPU 上用 fp32")  # bf16 的矩阵乘走 tensor core 内核，与 fp32 完全不同（nanoGPT 在 GPU 上同样默认 bf16）
     args = parser.parse_args()  # 解析参数
     cfg = CONFIGS["small" if args.small else "default"]  # 选定超参数组
     if args.batch_size is not None:  # 命令行显式指定了 batch_size 时覆盖默认值
         cfg = dict(cfg)  # 复制一份再改，避免污染全局配置字典
         cfg["batch_size"] = args.batch_size  # 应用覆盖值
     device = args.device  # 计算设备
+    use_bf16 = args.dtype == "bf16" or (args.dtype == "auto" and device.startswith("cuda"))  # 是否启用 bf16 混合精度（GPU 上默认开启，与 nanoGPT 一致）
     torch.manual_seed(1337)  # 固定随机种子，保证可复现
 
     train_data = np.memmap(os.path.join(DATA_DIR, "train.bin"), dtype=np.uint16, mode="r")  # 内存映射读取训练 token（不占内存，按需读盘）
     val_data = np.memmap(os.path.join(DATA_DIR, "val.bin"), dtype=np.uint16, mode="r")  # 同上，验证集
-    print(f"训练集 {len(train_data):,} tokens | 验证集 {len(val_data):,} tokens | 设备 {device}")  # 打印数据规模
+    print(f"训练集 {len(train_data):,} tokens | 验证集 {len(val_data):,} tokens | 设备 {device} | 精度 {'bf16 混合' if use_bf16 else 'fp32'}")  # 打印数据规模和训练精度
 
     model = GPT(GPTConfig(n_layer=cfg["n_layer"], n_head=cfg["n_head"], n_embd=cfg["n_embd"],  # 按配置构建模型
                           block_size=cfg["block_size"], vocab_size=8192, dropout=cfg["dropout"])).to(device)  # 搬到计算设备
@@ -93,6 +96,7 @@ def main():  # 主流程
     optimizer = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}],  # 分组 decay（nanoGPT 配方：对 1D 参数衰减会破坏训练稳定性）
                                   lr=cfg["learning_rate"], betas=(0.9, 0.95))  # AdamW 优化器
     data_dict = {"train": train_data, "val": val_data}  # 打包给评估函数用
+    autocast_ctx = torch.autocast(device_type="cuda" if device.startswith("cuda") else "cpu", dtype=torch.bfloat16, enabled=use_bf16)  # 混合精度上下文：矩阵乘等算子跑 bf16 内核，主权重保持 fp32（可重复进入）
     model.train()  # 训练模式
     t0 = time.time()  # 记时起点
     for it in range(1, cfg["max_iters"] + 1):  # 主训练循环
@@ -100,10 +104,18 @@ def main():  # 主流程
         for g in optimizer.param_groups:  # 应用到所有参数组
             g["lr"] = lr  # 设置本步学习率
         x, y = get_batch(train_data, cfg["block_size"], cfg["batch_size"], device)  # 取一批训练数据
-        _, loss = model(x, y)  # 前向计算 loss
-        if not torch.isfinite(loss):  # loss 变成 NaN/Inf 说明训练已经发散
-            print(f"iter {it}: loss = {loss.item()}，训练发散，提前停止（不保存本次权重）")  # 明确提示发散位置，便于定位原因
-            break  # 立即退出，避免带着 NaN 权重继续空跑
+        with autocast_ctx:  # 前向在混合精度下进行
+            _, loss = model(x, y)  # 前向计算 loss
+        if not torch.isfinite(loss):  # loss 变成 NaN/Inf
+            print(f"iter {it}: loss = {loss.item()}，提前停止（不保存本次权重）")  # 明确提示出现位置
+            if it == 1:  # 第一步就异常说明前向本身有问题（不是训练发散），自动用 CPU 复算同一批数据对照
+                cpu_model = GPT(model.config).cpu()  # 建同结构 CPU 副本
+                cpu_model.load_state_dict(model.state_dict())  # 载入同一份权重
+                cpu_model.eval()  # 关闭 dropout，得到干净的对照值
+                with torch.no_grad():  # 只做前向
+                    _, cpu_loss = cpu_model(x.cpu(), y.cpu())  # 同一批数据在 CPU 上复算
+                print(f"对照：同一权重同一批数据，CPU 前向 loss = {cpu_loss.item():.4f}")  # CPU 正常而 GPU 为 NaN 时即可锁定是 GPU 内核路径的问题
+            break  # 退出训练循环
         optimizer.zero_grad(set_to_none=True)  # 清空上一轮梯度
         loss.backward()  # 反向传播
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 梯度裁剪到 1.0，防止偶发大梯度破坏训练
@@ -113,7 +125,7 @@ def main():  # 主流程
             t0 = time.time()  # 重置计时
             print(f"iter {it:5d}/{cfg['max_iters']} | train loss {loss.item():.4f} | lr {lr:.2e} | {dt * 100:,.0f} ms/iter")  # 打印 loss、学习率和速度
         if it % cfg["eval_interval"] == 0 or it == cfg["max_iters"]:  # 定期评估并保存
-            losses = estimate_loss(model, data_dict, cfg, device)  # 评估训练/验证 loss
+            losses = estimate_loss(model, data_dict, cfg, device, autocast_ctx)  # 评估训练/验证 loss
             print(f"iter {it:5d} | eval train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")  # 打印评估结果
             if math.isfinite(losses["val"]):  # 只保存权重有效的 checkpoint
                 os.makedirs(OUT_DIR, exist_ok=True)  # 确保输出目录存在
