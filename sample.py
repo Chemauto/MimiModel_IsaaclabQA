@@ -29,6 +29,8 @@ def main():  # 主流程：加载模型 → 编码开头 → 生成 → 解码�
     ckpt = torch.load(args.model, map_location=device)  # 读取 checkpoint（含模型配置和权重）
     model = GPT(GPTConfig(**ckpt["config"])).to(device)  # 按保存时的配置重建同结构模型
     model.load_state_dict(ckpt["model"])  # 加载训练好的权重
+    if not all(torch.isfinite(p).all() for p in model.parameters()):  # 检查权重里是否混入 NaN/Inf
+        raise SystemExit("checkpoint 权重包含 NaN/Inf：模型在训练中已发散，请删除 out/model.pt 后重新训练")  # 直接给出原因和处理方式，而不是在采样时报底层错误
     model.eval()  # 切到评估模式（关闭 dropout）
     print(f"已加载 {args.model}（iter {ckpt['iter']}，val loss {ckpt['val_loss']:.4f}）")  # 打印模型信息
 

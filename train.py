@@ -7,6 +7,7 @@
 """
 
 import argparse  # 命令行参数解析库
+import math  # 数学库，用于余弦学习率调度
 import os  # 系统接口，用于拼接路径、创建目录
 import time  # 时间库，用于打印训练速度
 
@@ -20,10 +21,21 @@ OUT_DIR = os.path.join(BASE_DIR, "out")  # checkpoint 输出目录（已被 .git
 
 CONFIGS = {  # 两套预设超参数：默认给 GPU，small 给 CPU 冒烟
     "default": dict(n_layer=6, n_head=6, n_embd=384, block_size=256, batch_size=64,  # 模型与批量：约 10M 参数
-                    learning_rate=6e-4, max_iters=5000, eval_interval=200, eval_iters=100, dropout=0.1),  # 优化与评估节奏
+                    learning_rate=6e-4, min_lr=6e-5, warmup_iters=200,  # 学习率：线性预热后余弦退火到 min_lr
+                    max_iters=5000, eval_interval=200, eval_iters=100, dropout=0.1),  # 优化与评估节奏
     "small": dict(n_layer=2, n_head=2, n_embd=128, block_size=128, batch_size=16,  # 缩小的模型：约 1M 参数
-                  learning_rate=1e-3, max_iters=200, eval_interval=50, eval_iters=20, dropout=0.1),  # 少量迭代快速验证流程
+                  learning_rate=1e-3, min_lr=1e-4, warmup_iters=50,  # 同样采用预热 + 退火
+                  max_iters=200, eval_interval=50, eval_iters=20, dropout=0.1),  # 少量迭代快速验证流程
 }
+
+
+def get_lr(it, cfg):  # 第 it 步的学习率：先线性预热，再余弦退火（nanoGPT 的稳定训练配方）
+    if it < cfg["warmup_iters"]:  # 预热阶段：学习率从 0 线性升到目标值，避免训练初期大步长导致发散
+        return cfg["learning_rate"] * (it + 1) / cfg["warmup_iters"]  # 线性上升
+    if it >= cfg["max_iters"]:  # 训练结束之后
+        return cfg["min_lr"]  # 停在最低学习率
+    ratio = (it - cfg["warmup_iters"]) / (cfg["max_iters"] - cfg["warmup_iters"])  # 预热完成后的训练进度 0..1
+    return cfg["min_lr"] + 0.5 * (cfg["learning_rate"] - cfg["min_lr"]) * (1 + math.cos(math.pi * ratio))  # 沿余弦曲线从峰值平滑降到 min_lr
 
 
 def get_batch(split_data, block_size, batch_size, device):  # 从一份 token 数据中随机取一批样本
@@ -67,13 +79,23 @@ def main():  # 主流程
                           block_size=cfg["block_size"], vocab_size=8192, dropout=cfg["dropout"])).to(device)  # 搬到计算设备
     print(f"模型参数量: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M")  # 打印参数量
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["learning_rate"], betas=(0.9, 0.95), weight_decay=0.1)  # AdamW 优化器（简化：所有参数统一 decay）
+    decay, no_decay = [], []  # 参数分组：矩阵权重做 weight decay，LayerNorm/偏置不做
+    for p in model.parameters():  # 遍历全部参数
+        (decay if p.dim() >= 2 else no_decay).append(p)  # 按 ndim 分组（嵌入和线性层是 2D；LN 权重、偏置是 1D）
+    optimizer = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": no_decay, "weight_decay": 0.0}],  # 分组 decay（nanoGPT 配方：对 1D 参数衰减会破坏训练稳定性）
+                                  lr=cfg["learning_rate"], betas=(0.9, 0.95))  # AdamW 优化器
     data_dict = {"train": train_data, "val": val_data}  # 打包给评估函数用
     model.train()  # 训练模式
     t0 = time.time()  # 记时起点
     for it in range(1, cfg["max_iters"] + 1):  # 主训练循环
+        lr = get_lr(it, cfg)  # 按预热 + 余弦退火计划计算当前学习率
+        for g in optimizer.param_groups:  # 应用到所有参数组
+            g["lr"] = lr  # 设置本步学习率
         x, y = get_batch(train_data, cfg["block_size"], cfg["batch_size"], device)  # 取一批训练数据
         _, loss = model(x, y)  # 前向计算 loss
+        if not torch.isfinite(loss):  # loss 变成 NaN/Inf 说明训练已经发散
+            print(f"iter {it}: loss = {loss.item()}，训练发散，提前停止（不保存本次权重）")  # 明确提示发散位置，便于定位原因
+            break  # 立即退出，避免带着 NaN 权重继续空跑
         optimizer.zero_grad(set_to_none=True)  # 清空上一轮梯度
         loss.backward()  # 反向传播
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)  # 梯度裁剪到 1.0，防止偶发大梯度破坏训练
@@ -81,14 +103,17 @@ def main():  # 主流程
         if it % 10 == 0:  # 每 10 步打印一次训练状态
             dt = time.time() - t0  # 最近 10 步耗时
             t0 = time.time()  # 重置计时
-            print(f"iter {it:5d}/{cfg['max_iters']} | train loss {loss.item():.4f} | {dt * 100:,.0f} ms/iter")  # 打印 loss 和速度
+            print(f"iter {it:5d}/{cfg['max_iters']} | train loss {loss.item():.4f} | lr {lr:.2e} | {dt * 100:,.0f} ms/iter")  # 打印 loss、学习率和速度
         if it % cfg["eval_interval"] == 0 or it == cfg["max_iters"]:  # 定期评估并保存
             losses = estimate_loss(model, data_dict, cfg, device)  # 评估训练/验证 loss
             print(f"iter {it:5d} | eval train loss {losses['train']:.4f} | val loss {losses['val']:.4f}")  # 打印评估结果
-            os.makedirs(OUT_DIR, exist_ok=True)  # 确保输出目录存在
-            torch.save({"model": model.state_dict(), "config": model.config.__dict__, "iter": it, "val_loss": losses["val"]},  # 保存权重+配置+进度
-                       os.path.join(OUT_DIR, "model.pt"))  # checkpoint 路径
-            print(f"模型已保存到 {os.path.join(OUT_DIR, 'model.pt')}")  # 保存提示
+            if math.isfinite(losses["val"]):  # 只保存权重有效的 checkpoint
+                os.makedirs(OUT_DIR, exist_ok=True)  # 确保输出目录存在
+                torch.save({"model": model.state_dict(), "config": model.config.__dict__, "iter": it, "val_loss": losses["val"]},  # 保存权重+配置+进度
+                           os.path.join(OUT_DIR, "model.pt"))  # checkpoint 路径
+                print(f"模型已保存到 {os.path.join(OUT_DIR, 'model.pt')}")  # 保存提示
+            else:  # 验证 loss 非有限值，说明权重已损坏
+                print("验证 loss 非有限值，跳过保存，保留上一个有效 checkpoint")  # 防止用坏权重覆盖好 checkpoint
     print("训练完成")  # 结束提示
 
 
