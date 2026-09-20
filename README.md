@@ -20,6 +20,23 @@ python prepare_data.py --dataset minimind --max_train_stories 2000 --max_val_sto
 
 注意：分词器是在所选语料上现训的，切换数据集后产出的分词器与模型和之前语料的版本**不通用**，需要走完整的预训练 → SFT 流程。
 
+**中文全链路（minimind）**：SFT/DPO/评估均支持 `--dataset minimind`，模板为中文问答（`问：…\n答：…`）：
+
+```bash
+python prepare_data.py --dataset minimind --max_train_stories 200000 --max_val_stories 2000   # 预训练语料
+python train.py                                                                                # 预训练
+
+python sft/prepare_sft.py --dataset minimind --max_train_samples 50000    # 中文问答 SFT 数据（sft_t2t_mini.jsonl）
+python sft/train_sft.py
+python sft/sample_sft.py --style chat --instructions "为什么天空是蓝色的？"
+
+python dpo/prepare_dpo.py --dataset minimind --n_instructions 2000        # 中文现成偏好对（dpo.jsonl，无需采样打分）
+python dpo/train_dpo.py
+python sft/sample_sft.py --model out/model_dpo.pt --style chat --instructions "写一句关于春天的诗。"
+
+python eval/eval_instruction.py --dataset minimind --models out/model_sft.pt out/model_dpo.pt --n 50
+```
+
 **2. 训练**
 
 ```bash

@@ -9,6 +9,7 @@
 
 用法（在项目根目录执行）：
   python eval/eval_instruction.py --models out/model.pt out/model_sft.pt out/model_dpo.pt --n 50
+  python eval/eval_instruction.py --dataset minimind --models out/model_sft.pt --n 50   # 中文问答模型
 """
 
 import argparse  # 命令行参数解析库
@@ -23,18 +24,21 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # 项目
 sys.path.insert(0, ROOT_DIR)  # 导入根目录模块
 sys.path.insert(0, os.path.join(ROOT_DIR, "sft"))  # 复用 sft 目录的指令解析
 from model import GPT, GPTConfig  # 模型定义
-from prepare_sft import iter_examples, pick_instruction  # 从数据流取指令
+from prepare_sft import iter_examples, iter_chat_pairs, pick_instruction  # 从数据流取指令（英文/中文两种）
 
 
 @torch.no_grad()  # 生成不需要梯度
-def generate_stories(model, tok, instructions, device, temperature, top_k, max_new_tokens):  # 对每条指令生成一个故事
-    """返回 (故事列表, 完成率)：完成 = 采样到结束符。"""
+def generate_stories(model, tok, instructions, device, temperature, top_k, max_new_tokens, style="story"):  # 对每条指令生成一个回答
+    """返回 (回答列表, 完成率)：完成 = 采样到结束符。"""
     model.eval()  # 评估模式
     results, complete = [], 0  # 结果与完成计数
     eot_id = tok.token_to_id("<|endoftext|>")  # 结束符
     block = model.config.block_size  # 上下文长度
     for instr in instructions:  # 逐条生成（清晰优先；大批量可用 batch 优化）
-        prompt = f"Instructions: {instr}\nStory:"  # 与 SFT/DPO 训练一致的模板
+        if style == "chat":  # 中文问答模板（与 minimind SFT 一致）
+            prompt = f"问：{instr}\n答："  # 问/答标记
+        else:  # 英文写故事模板（与 TinyStories-instruct SFT 一致）
+            prompt = f"Instructions: {instr}\nStory:"  # Instructions/Story 标记
         start_ids = tok.encode(prompt).ids  # 编码
         x = torch.tensor([start_ids], dtype=torch.long, device=device)  # (1, T)
         budget = min(max_new_tokens, max(block - len(start_ids), 1))  # 窗口内可生成长度
@@ -67,22 +71,33 @@ def main():  # 主流程
     parser.add_argument("--max_new_tokens", type=int, default=200, help="每条最多生成 token 数")  # 长度
     parser.add_argument("--temperature", type=float, default=0.8, help="采样温度")  # 温度
     parser.add_argument("--top_k", type=int, default=50, help="top-k 截断")  # top-k
-    parser.add_argument("--embed_model", type=str, default="sentence-transformers/all-MiniLM-L6-v2", help="相关性打分用句向量模型")  # 打分模型
+    parser.add_argument("--dataset", type=str, default="tinystories-instruct",  # 指令来源与模板
+                        choices=["tinystories-instruct", "minimind"],  # 英文故事 / 中文问答
+                        help="须与 SFT 训练的数据集一致（决定指令来源、模板与相关性句向量模型）")  # 说明
+    parser.add_argument("--embed_model", type=str, default=None,  # 相关性打分模型
+                        help="句向量模型（默认按数据集自动选择：英文 all-MiniLM-L6-v2 / 中文 bge-small-zh-v1.5）")  # 说明
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="设备")  # 设备
     args = parser.parse_args()  # 解析
 
     from datasets import load_dataset  # 指令来源
-    ds = load_dataset("roneneldan/TinyStories-instruct", split="train", streaming=True)  # 流式读取
-    instructions = []  # 收集评估指令
-    for instr_text, _story in iter_examples(ds):  # 复用 SFT 解析
-        instructions.append(pick_instruction(instr_text))  # 取摘要行
-        if len(instructions) >= args.n:  # 收满即停
-            break  # 退出
-    print(f"评估指令 {len(instructions)} 条\n")  # 打印规模
+    if args.dataset == "minimind":  # 中文问答指令
+        ds = load_dataset("jingyaogong/minimind_dataset", data_files="sft_t2t_mini.jsonl",  # minimind SFT 数据
+                          split="train", streaming=True)  # 流式读取
+        instructions = [q for q, _a in iter_chat_pairs(ds)][:args.n]  # 取中文提问
+    else:  # 英文故事指令
+        ds = load_dataset("roneneldan/TinyStories-instruct", split="train", streaming=True)  # 流式读取
+        instructions = []  # 收集评估指令
+        for instr_text, _story in iter_examples(ds):  # 复用 SFT 解析
+            instructions.append(pick_instruction(instr_text))  # 取摘要行
+            if len(instructions) >= args.n:  # 收满即停
+                break  # 退出
+    embed_model = args.embed_model or ("BAAI/bge-small-zh-v1.5" if args.dataset == "minimind"  # 中文默认用 bge
+                                       else "sentence-transformers/all-MiniLM-L6-v2")  # 英文默认用 MiniLM
+    print(f"评估指令 {len(instructions)} 条（{args.dataset}）\n")  # 打印规模
 
     try:  # 相关性指标依赖 sentence-transformers，缺库时跳过该列
         from sentence_transformers import SentenceTransformer, util  # 导入
-        st = SentenceTransformer(args.embed_model)  # 加载句向量模型
+        st = SentenceTransformer(embed_model)  # 加载句向量模型（按数据集自动选择）
         instr_emb = st.encode(instructions, convert_to_tensor=True, show_progress_bar=False)  # 指令向量只算一次
     except Exception as e:  # 缺库或下载失败
         print(f"[提示] 句向量模型不可用（{e.__class__.__name__}），跳过 relevance 指标")  # 提示
@@ -99,8 +114,9 @@ def main():  # 主流程
         ckpt = torch.load(path, map_location="cpu")  # 读 checkpoint
         model = GPT(GPTConfig(**ckpt["config"])).to(args.device)  # 重建模型
         model.load_state_dict(ckpt["model"])  # 载入权重
-        stories, completion = generate_stories(model, tok, instructions, args.device,  # 生成全部故事
-                                               args.temperature, args.top_k, args.max_new_tokens)  # 参数
+        stories, completion = generate_stories(model, tok, instructions, args.device,  # 生成全部回答
+                                               args.temperature, args.top_k, args.max_new_tokens,  # 采样参数
+                                               style="chat" if args.dataset == "minimind" else "story")  # 模板与训练一致
         d2 = distinct_n(stories, 2)  # 多样性
         avg_len = sum(len(s.split()) for s in stories) / max(len(stories), 1)  # 平均词数
         rel_str = "-"  # 相关性默认不展示

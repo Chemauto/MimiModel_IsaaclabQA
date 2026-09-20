@@ -1,14 +1,15 @@
 # -*- coding: utf-8 -*-
-"""SFT 数据准备：下载 TinyStories-instruct，打包成「指令 → 故事」格式的微调样本。
+"""SFT 数据准备：把指令-回答语料打包成微调样本，支持 --dataset 切换两种链路。
 
-原始数据是按行存储的 txt（流式读取后每行一个 'text' 字段），每条样本的块结构为：
-  指令行（Features / Words / Summary，顺序不定，可有可无）
-  Story:
-  空行 + 故事正文若干行
-  <|endoftext|>
-本脚本把行重组为 (指令, 故事) 对，再编码成统一模板（不新增任何特殊 token）：
+【tinystories-instruct（默认，英文）】原始数据是按行存储的 txt，块结构为
+  指令行（Features / Words / Summary）→ "Story:" → 故事正文 → <|endoftext|>
+重组后编码成模板（不新增任何特殊 token）：
   Instructions: <指令文本>\nStory: <故事><|endoftext|>
-损失掩码：提示部分 label 置 -100（不计算损失），只在故事部分学习。
+
+【minimind（中文）】sft_t2t_mini.jsonl 的 conversations 多轮对话，拆成单轮 (问, 答)：
+  问：<用户提问>\n答：<助手回答><|endoftext|>
+
+损失掩码：提示部分 label 置 -100（不计算损失），标签相对输入右移一位（预测下一个 token）。
 
 运行后在 data/ 目录产出（不影响 prepare_data.py 的产物）：
   sft_train_ids.bin / sft_train_labels.bin   训练集：input_ids 与 labels，各 (n, max_len) 的 int16
@@ -26,7 +27,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent  # 项目根目录 mimi_gpt/�
 DATA_DIR = ROOT_DIR / "data"  # 数据目录（与预训练阶段共享，已被 .gitignore 忽略）
 
 
-def iter_examples(ds):  # 把按行流式读取的数据重组为 (指令文本, 故事文本)
+def iter_examples(ds):  # 英文链路：把按行流式读取的数据重组为 (指令文本, 故事文本)
     """逐行遍历数据流，按块结构切分并产出完整的 (指令, 故事) 样本。"""
     instr_lines, story_lines, in_story = [], [], False  # 解析状态：指令行缓存、故事行缓存、是否已进入故事区
     for row in ds:  # 逐行遍历流式数据
@@ -52,23 +53,38 @@ def pick_instruction(instr_text):  # 从指令块里挑出最紧凑的指令文�
     return instr_text  # 没有摘要时用全部指令行
 
 
-def build_sample(tok, instr_text, story, max_len):  # 把一条 (指令, 故事) 编码成训练样本
-    """返回 (input_ids, labels, truncated)；提示过长返回 None，故事过长截断兜底。"""
-    instr = pick_instruction(instr_text)  # 选出紧凑指令文本
-    prompt = f"Instructions: {instr}\nStory:"  # 提示模板（模型据此知道任务和背景）
+def iter_chat_pairs(ds):  # 中文链路：把多轮对话拆成单轮 (问, 答) 样本
+    """每条会话按轮次顺序配对：暂存提问，遇到回答即产出 (问, 答)。"""
+    for row in ds:  # 逐条会话
+        conv = row.get("conversations") or []  # 会话轮次列表
+        pending_user = None  # 待配对的提问
+        for turn in conv:  # 遍历轮次
+            role = turn.get("role")  # 角色（user/assistant）
+            content = (turn.get("content") or "").strip()  # 轮次内容
+            if not content:  # 空内容跳过
+                continue  # 下一轮
+            if role == "user":  # 提问轮
+                pending_user = content  # 暂存，等待配对回答
+            elif role == "assistant" and pending_user:  # 回答轮且有配对提问
+                yield pending_user, content  # 产出 (问, 答)
+                pending_user = None  # 清空，后续轮重新配对
+
+
+def build_sample(tok, prompt, response, max_len):  # 把一条 (提示, 回答) 编码成训练样本
+    """返回 (input_ids, labels, truncated)；提示过长返回 None，回答过长截断兜底。"""
     prompt_ids = tok.encode(prompt).ids  # 提示部分编码（这些位置不学习）
-    budget = max_len - len(prompt_ids) - 1  # 故事可用 token 数（预留 1 位给结束符）
-    if budget < 16:  # 提示就把窗口占满了，剩余空间写不出有意义的故事
+    budget = max_len - len(prompt_ids) - 1  # 回答可用 token 数（预留 1 位给结束符）
+    if budget < 16:  # 提示就把窗口占满了，剩余空间写不出有意义的回答
         return None  # 跳过
-    resp_ids = tok.encode(" " + story).ids  # 回答部分编码：故事正文
+    resp_ids = tok.encode(response).ids  # 回答部分编码
     truncated = len(resp_ids) > budget  # 是否需要截断
-    if truncated:  # 截断兜底（保留故事开头，丢弃尾部），避免样本被整条丢弃
+    if truncated:  # 截断兜底（保留回答开头，丢弃尾部），避免样本被整条丢弃
         resp_ids = resp_ids[:budget]  # 截断到可用空间
-    resp_ids = resp_ids + [tok.token_to_id("<|endoftext|>")]  # 末尾补结束符，模型学会"写到这里为止"
+    resp_ids = resp_ids + [tok.token_to_id("<|endoftext|>")]  # 末尾补结束符，模型学会"答到这里为止"
     ids = prompt_ids + resp_ids  # 模型的完整输入序列
     # 标签必须右移一位（语言模型的本职是预测"下一个"token）：
     #   位置 t 的标签是 ids[t+1]；提示内部位置不学习（-100）；
-    #   提示的最后一个位置负责产出故事的第一个 token，故事的最后一个位置负责产出结束符。
+    #   提示的最后一个位置负责产出回答的第一个 token，回答的最后一个位置负责产出结束符。
     labels = [-100] * len(ids)  # 先全部置为忽略
     for t in range(len(prompt_ids) - 1, len(ids) - 1):  # 从提示末位遍历到倒数第二位
         labels[t] = ids[t + 1]  # 标签指向下一个 token
@@ -86,27 +102,39 @@ def pad_and_write(samples, ids_path, labels_path, max_len):  # 补齐到统一�
     np.array(label_rows, dtype=np.int16).tofile(labels_path)  # labels 同样写成 int16
 
 
-def main():  # 主流程：下载 → 重组 → 编码打包 → 落盘
-    parser = argparse.ArgumentParser(description="准备 TinyStories-instruct SFT 数据")  # 命令行入口
+def main():  # 主流程：下载数据 → 按模板编码打包 → 落盘
+    parser = argparse.ArgumentParser(description="准备 SFT 微调数据")  # 命令行入口
+    parser.add_argument("--dataset", type=str, default="tinystories-instruct",  # 数据集选择
+                        choices=["tinystories-instruct", "minimind"],  # 英文故事 / 中文对话两条链路
+                        help="tinystories-instruct=英文按摘要写故事（默认），minimind=中文问答回话（需预训练也用 minimind 语料）")  # 说明
     parser.add_argument("--max_train_samples", type=int, default=50_000, help="训练样本条数上限")  # 训练规模
     parser.add_argument("--max_val_samples", type=int, default=500, help="验证样本条数上限")  # 验证规模
     parser.add_argument("--max_len", type=int, default=256, help="单条样本最大 token 数（须不超过模型 block_size）")  # 序列长度上限
     args = parser.parse_args()  # 解析参数
 
     tok = Tokenizer.from_file(str(DATA_DIR / "tokenizer.json"))  # 加载预训练时训好的分词器（必须与预训练一致）
-    ds = load_dataset("roneneldan/TinyStories-instruct", split="train", streaming=True)  # 流式读取原始 txt
+    if args.dataset == "minimind":  # 中文问答回话链路
+        ds = load_dataset("jingyaogong/minimind_dataset", data_files="sft_t2t_mini.jsonl",  # minimind SFT 数据
+                          split="train", streaming=True)  # 流式读取
+        example_iter = iter_chat_pairs(ds)  # 拆成 (问, 答) 迭代器
+    else:  # 英文按摘要写故事链路
+        ds = load_dataset("roneneldan/TinyStories-instruct", split="train", streaming=True)  # 流式读取原始 txt
+        example_iter = ((pick_instruction(instr), story) for instr, story in iter_examples(ds))  # (摘要, 故事) 迭代器
 
-    DATA_DIR.mkdir(exist_ok=True)  # 确保数据目录存在
     train_samples, val_samples = [], []  # 分别收集训练/验证样本
-    skipped, truncated = 0, 0  # 统计：跳过条数（缺故事/提示过长）、故事被截断条数
+    skipped, truncated = 0, 0  # 统计：跳过条数、回答被截断条数
     processed = 0  # 已处理的完整样本数
-    for instr_text, story in iter_examples(ds):  # 逐条产出重组后的样本
-        if processed == 0:  # 打印第一条的指令与故事开头，便于人工核对解析结果
-            print("首条指令:", pick_instruction(instr_text)[:150])  # 指令拼接结果
-            print("首条故事开头:", story[:100])  # 故事开头
+    for source_text, response_text in example_iter:  # 逐条产出 (提示素材, 回答正文)
+        if args.dataset == "minimind":  # 中文模板：问/答
+            prompt, response = f"问：{source_text}\n答：", response_text  # 拼提示与回答
+        else:  # 英文模板：Instructions/Story
+            prompt, response = f"Instructions: {source_text}\nStory:", " " + response_text  # 拼提示与回答（回答带前导空格）
+        if processed == 0:  # 打印第一条的提示与回答开头，便于人工核对模板
+            print("首条提示:", prompt[:150])  # 提示拼接结果
+            print("首条回答开头:", response[:100])  # 回答开头
         split_samples = val_samples if len(val_samples) < args.max_val_samples else train_samples  # 前若干条划给验证集，其余给训练集
-        result = build_sample(tok, instr_text, story, args.max_len)  # 编码样本
-        if result is None:  # 缺故事或提示过长
+        result = build_sample(tok, prompt, response, args.max_len)  # 编码样本
+        if result is None:  # 缺回答或提示过长
             skipped += 1  # 计入跳过数
         else:  # 编码成功
             ids, labels, was_truncated = result  # 解包编码结果
@@ -120,13 +148,13 @@ def main():  # 主流程：下载 → 重组 → 编码打包 → 落盘
 
     pad_and_write(train_samples, DATA_DIR / "sft_train_ids.bin", DATA_DIR / "sft_train_labels.bin", args.max_len)  # 训练集落盘
     pad_and_write(val_samples, DATA_DIR / "sft_val_ids.bin", DATA_DIR / "sft_val_labels.bin", args.max_len)  # 验证集落盘
-    print(f"SFT 数据准备完成：训练 {len(train_samples)} 条，验证 {len(val_samples)} 条，跳过 {skipped} 条，故事截断 {truncated} 条")  # 汇总
+    print(f"SFT 数据准备完成：训练 {len(train_samples)} 条，验证 {len(val_samples)} 条，跳过 {skipped} 条，回答截断 {truncated} 条")  # 汇总
     if train_samples:  # 有样本时打印一条示例，方便人工检查模板和掩码
         ids, labels = train_samples[0]  # 取第一条样本
         print("---- 示例（第一条样本解码 + 掩码统计）----")  # 说明打印含义
         print(tok.decode(ids)[:200])  # 打印解码后的文本前 200 字符
         learned = sum(1 for l in labels if l != -100)  # 统计参与损失计算的位置数
-        print(f"总长 {len(ids)}，其中参与损失计算的位置 {learned} 个（即故事部分）")  # 打印掩码统计
+        print(f"总长 {len(ids)}，其中参与损失计算的位置 {learned} 个（即回答部分）")  # 打印掩码统计
 
 
 if __name__ == "__main__":  # 作为脚本直接运行时才执行

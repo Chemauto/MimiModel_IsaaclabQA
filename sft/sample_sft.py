@@ -3,6 +3,7 @@
 
 用法示例（在项目根目录 mimi_gpt/ 下执行）：
   python sft/sample_sft.py --instructions "Write a short story about a little kitten who makes a new friend."
+  python sft/sample_sft.py --style chat --instructions "为什么天空是蓝色的？"          # minimind 中文问答模型用 chat 模板
   python sft/sample_sft.py --instructions "Summary: A boy loses his kite in a tree, and a bird helps him get it back."
 """
 
@@ -20,7 +21,8 @@ from model import GPT, GPTConfig  # 模型定义
 
 def main():  # 主流程：加载 SFT 模型 → 拼模板 → 生成故事部分
     parser = argparse.ArgumentParser(description="用 SFT 模型按指令写故事")  # 命令行入口
-    parser.add_argument("--instructions", type=str, default="Write a short story about a little kitten who makes a new friend.", help="给模型的指令（情节摘要/特征/要求等）")  # 指令文本
+    parser.add_argument("--instructions", type=str, default="Write a short story about a little kitten who makes a new friend.", help="给模型的指令（英文故事）或提问（中文问答）")  # 输入文本
+    parser.add_argument("--style", type=str, default="story", choices=["story", "chat"], help="模板：story=英文写故事，chat=中文问答（须与 SFT 训练时一致）")  # 模板风格
     parser.add_argument("--max_new_tokens", type=int, default=215, help="最多生成多少 token（提示已占约 40，上限为 block_size）")  # 生成长度上限
     parser.add_argument("--temperature", type=float, default=0.8, help="采样温度：<1 更保守，>1 更发散")  # 温度
     parser.add_argument("--top_k", type=int, default=50, help="只从概率最高的 k 个 token 中采样")  # top-k
@@ -37,8 +39,11 @@ def main():  # 主流程：加载 SFT 模型 → 拼模板 → 生成故事部�
     print(f"已加载 {args.model}（iter {ckpt['iter']}，val loss {ckpt['val_loss']:.4f}）")  # 打印模型信息
 
     tok = Tokenizer.from_file(str(ROOT_DIR / "data" / "tokenizer.json"))  # 分词器与预训练/SFT 完全一致
-    eot_id = tok.token_to_id("<|endoftext|>")  # 结束符：故事写完时模型会输出它
-    prompt = f"Instructions: {args.instructions}\nStory:"  # 与 SFT 训练时完全相同的模板
+    eot_id = tok.token_to_id("<|endoftext|>")  # 结束符：故事/回答写完时模型会输出它
+    if args.style == "chat":  # 中文问答模板（与 minimind SFT 训练一致）
+        prompt = f"问：{args.instructions}\n答："  # 问/答标记
+    else:  # 英文写故事模板（与 TinyStories-instruct SFT 训练一致）
+        prompt = f"Instructions: {args.instructions}\nStory:"  # Instructions/Story 标记
     start_ids = tok.encode(prompt).ids  # 编码提示
     x = torch.tensor([start_ids], dtype=torch.long, device=device)  # (1, T) 输入张量
     budget = ckpt["config"]["block_size"] - len(start_ids)  # 上下文窗口内还能生成的 token 数
