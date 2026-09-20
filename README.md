@@ -43,6 +43,10 @@ python sample.py --prompt "One day, a little dog" --max_new_tokens 500 --tempera
 | sft/prepare_sft.py | 下载 TinyStories-instruct，打包成「指令 → 故事」样本并生成损失掩码 |
 | sft/train_sft.py | SFT 后训练：从 out/model.pt 继续训练，只对故事部分计算损失，保存到 out/model_sft.pt |
 | sft/sample_sft.py | 加载 SFT 模型，按指令写故事 |
+| dpo/prepare_dpo.py | SFT 模型采样 + 句向量打分，构造「chosen/rejected」偏好对 |
+| dpo/train_dpo.py | DPO 对齐训练（policy + 冻结 reference），保存到 out/model_dpo.pt |
+| eval/export_hf.py | 把 checkpoint 导出成 HuggingFace 格式 |
+| eval/eval_instruction.py | 指令跟随指标（相关性/多样性/完整率）多 checkpoint 对比，详见 [eval/README.md](eval/README.md) |
 
 ## SFT 后训练（可选的第二阶段）
 
@@ -60,6 +64,20 @@ python sft/sample_sft.py --instructions "Write a short story about a little kitt
 Instructions: <情节摘要 / 特征 / 词汇要求>
 Story: <故事><|endoftext|>
 ```
+
+## DPO 对齐训练（第三阶段）
+
+用偏好对做直接偏好优化：SFT 模型对同一指令采样多个故事，按「指令-故事」相关性挑出 chosen/rejected，训练让模型偏向好回答。依赖 `pip install sentence-transformers`，且需先完成 SFT（用到 `out/model_sft.pt`）。
+
+```bash
+python dpo/prepare_dpo.py --n_instructions 2000    # 采样 + 打分 + 构造偏好对
+python dpo/train_dpo.py                            # DPO 训练，保存到 out/model_dpo.pt
+python sft/sample_sft.py --model out/model_dpo.pt --instructions "..."   # 用 DPO 模型生成
+```
+
+## 评估
+
+通用基准（lm-eval-harness：hellaswag / arc_easy / piqa / winogrande）与任务适配指标（relevance / distinct-2 / completion）的说明与命令见 [eval/README.md](eval/README.md)。
 
 ## 超参数
 
