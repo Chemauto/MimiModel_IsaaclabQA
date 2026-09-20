@@ -66,7 +66,12 @@ def build_sample(tok, instr_text, story, max_len):  # 把一条 (指令, 故事)
         resp_ids = resp_ids[:budget]  # 截断到可用空间
     resp_ids = resp_ids + [tok.token_to_id("<|endoftext|>")]  # 末尾补结束符，模型学会"写到这里为止"
     ids = prompt_ids + resp_ids  # 模型的完整输入序列
-    labels = [-100] * len(prompt_ids) + resp_ids  # 提示位置置 -100（交叉熵默认忽略），故事位置保留真值
+    # 标签必须右移一位（语言模型的本职是预测"下一个"token）：
+    #   位置 t 的标签是 ids[t+1]；提示内部位置不学习（-100）；
+    #   提示的最后一个位置负责产出故事的第一个 token，故事的最后一个位置负责产出结束符。
+    labels = [-100] * len(ids)  # 先全部置为忽略
+    for t in range(len(prompt_ids) - 1, len(ids) - 1):  # 从提示末位遍历到倒数第二位
+        labels[t] = ids[t + 1]  # 标签指向下一个 token
     return ids, labels, truncated  # 返回编码结果与截断标记
 
 
