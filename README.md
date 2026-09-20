@@ -1,6 +1,6 @@
 # mimi_gpt 🤖
 
-极简 GPT 实现，用 TinyStories 数据集训练一个会续写英文小故事的迷你语言模型，完整走一遍「数据准备 → 预训练 → 采样」流程。
+极简 GPT 实现，用 TinyStories 或 minimind 中文语料训练一个迷你语言模型，完整走一遍「数据准备 → 预训练 → SFT 后训练 → DPO 对齐 → 评估」流程。
 
 ## 环境依赖
 
@@ -10,12 +10,15 @@ pip install torch datasets tokenizers numpy
 
 ## 三步运行
 
-**1. 准备数据**：自动从 Hugging Face 流式下载 TinyStories 到 `data/` 目录（已写入 `.gitignore`，不会进入 git 记录），然后训练 BPE 分词器、生成训练用的二进制 token 文件。
+**1. 准备数据**：自动从 Hugging Face 流式下载所选语料到 `data/` 目录（已写入 `.gitignore`，不会进入 git 记录），然后训练 BPE 分词器、生成训练用的二进制 token 文件。支持 `--dataset` 切换：
 
 ```bash
-python prepare_data.py --max_train_stories 100000 --max_val_stories 2000   # GPU 训练推荐规模
-python prepare_data.py --max_train_stories 2000 --max_val_stories 200      # CPU 冒烟验证
+python prepare_data.py --dataset tinystories --max_train_stories 100000 --max_val_stories 2000   # 英文童话（默认），GPU 推荐规模
+python prepare_data.py --dataset minimind --max_train_stories 200000 --max_val_stories 2000      # minimind 中文混合语料（pretrain_t2t_mini.jsonl，几百 MB）
+python prepare_data.py --dataset minimind --max_train_stories 2000 --max_val_stories 200         # CPU 冒烟验证
 ```
+
+注意：分词器是在所选语料上现训的，切换数据集后产出的分词器与模型和之前语料的版本**不通用**，需要走完整的预训练 → SFT 流程。
 
 **2. 训练**
 
@@ -36,7 +39,7 @@ python sample.py --prompt "One day, a little dog" --max_new_tokens 500 --tempera
 
 | 文件 | 说明 |
 |---|---|
-| prepare_data.py | 下载 TinyStories、训练 8k 词表 BPE、生成 train.bin / val.bin |
+| prepare_data.py | 下载预训练语料（TinyStories 英文 / minimind 中文，`--dataset` 切换）、训练 8k 词表 BPE、生成 train.bin / val.bin |
 | model.py | 极简 GPT 模型（嵌入 + 因果自注意力 + MLP，权重绑定） |
 | train.py | 预训练脚本（下一 token 预测，AdamW + 梯度裁剪） |
 | sample.py | 加载 checkpoint，按 temperature + top-k 采样续写 |

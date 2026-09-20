@@ -17,20 +17,36 @@ from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders  # 
 BASE_DIR = Path(__file__).resolve().parent  # 脚本所在目录（mimi_gpt/）
 DATA_DIR = BASE_DIR / "data"  # 数据目录：mimi_gpt/data/（已被 .gitignore 忽略，不会进 git）
 
+DATASETS = {  # 可选预训练语料注册表：--dataset 切换
+    "tinystories": dict(  # 英文童话故事（原默认，教学最稳）
+        hf_id="roneneldan/TinyStories",  # HuggingFace 数据集 id
+        default_train=100_000, default_val=2_000),  # 推荐条数（条 = 一个故事）
+    "minimind": dict(  # minimind 项目中文混合语料（中英、对话式短文本）
+        hf_id="jingyaogong/minimind_dataset",  # HuggingFace 数据集 id
+        data_file="pretrain_t2t_mini.jsonl",  # 精简版预训练文件（几百 MB）
+        default_train=200_000, default_val=2_000),  # 推荐条数（条 = 一段文本样本）
+}
 
-def download_corpus(max_train_stories, max_val_stories):  # 下载指定条数的故事，写成训练/验证两份纯文本语料
-    """流式下载 TinyStories，写出到 data/corpus_train.txt 与 data/corpus_val.txt。"""
+
+def download_corpus(max_train_stories, max_val_stories, dataset):  # 下载指定条数样本，写成训练/验证两份纯文本语料
+    """流式下载所选数据集，写出到 data/corpus_train.txt 与 data/corpus_val.txt。"""
+    spec = DATASETS[dataset]  # 取出所选数据集的配置
     DATA_DIR.mkdir(exist_ok=True)  # 创建数据目录（已存在则跳过）
-    ds = load_dataset("roneneldan/TinyStories", split="train", streaming=True)  # 流式加载：只拉取需要的条数，不全量下载约 2GB 数据
+    if dataset == "minimind":  # minimind 仓库含多个 jsonl，需指定文件
+        ds = load_dataset(spec["hf_id"], data_files=spec["data_file"], split="train", streaming=True)  # 流式读取精简版预训练文件
+    else:  # tinystories 及其他单配置数据集
+        ds = load_dataset(spec["hf_id"], split="train", streaming=True)  # 流式加载：只拉取需要的条数
     paths = {"val": DATA_DIR / "corpus_val.txt", "train": DATA_DIR / "corpus_train.txt"}  # 两份语料的输出路径（流里先取的划给验证集）
     files = {name: open(path, "w", encoding="utf-8") for name, path in paths.items()}  # 同时打开两个输出文件
     try:  # 用 try/finally 保证文件最终一定被关闭
         for i, item in enumerate(ds.take(max_train_stories + max_val_stories)):  # 从数据流中顺序取出指定总条数
-            story = item["story"] if "story" in item else item["text"]  # 取出故事正文（兼容不同字段名）
+            text = item["story"] if "story" in item else item["text"]  # 取出样本正文（兼容不同字段名）
+            if not text or not text.strip():  # 空样本直接跳过
+                continue  # 处理下一条
             split = "val" if i < max_val_stories else "train"  # 前面一部分划给验证集，其余划给训练集
-            files[split].write(story.strip() + "\n<|endoftext|>\n")  # 写入一条故事，故事之间用 <|endoftext|> 标记边界
-            if (i + 1) % 500 == 0:  # 每下载 500 条打印一次进度
-                print(f"已下载 {i + 1} 条故事")
+            files[split].write(text.strip() + "\n<|endoftext|>\n")  # 写入一条样本，样本之间用 <|endoftext|> 标记边界
+            if (i + 1) % 5000 == 0:  # 每下载 5000 条打印一次进度
+                print(f"已下载 {i + 1} 条样本")
     finally:  # 无论是否异常都执行收尾
         for f in files.values():  # 遍历两个文件句柄
             f.close()  # 关闭文件，落盘
@@ -62,13 +78,18 @@ def encode_to_bin(tok, corpus_path, bin_path):  # 把一份语料编码成 token
 
 
 def main():  # 主流程：下载 → 训分词器 → 生成两个 bin
-    parser = argparse.ArgumentParser(description="下载 TinyStories 并生成训练数据")  # 命令行入口
-    parser.add_argument("--max_train_stories", type=int, default=100_000, help="训练集故事条数（GPU 推荐规模）")  # 训练集规模
-    parser.add_argument("--max_val_stories", type=int, default=2_000, help="验证集故事条数")  # 验证集规模
+    parser = argparse.ArgumentParser(description="下载预训练语料并生成训练数据")  # 命令行入口
+    parser.add_argument("--dataset", type=str, default="tinystories", choices=list(DATASETS.keys()),  # 语料选择
+                        help="预训练数据集：tinystories=英文童话（默认），minimind=中文混合语料（几百 MB 精简版）")  # 说明
+    parser.add_argument("--max_train_stories", type=int, default=None, help="训练集条数上限（默认取所选数据集的推荐值）")  # 训练规模
+    parser.add_argument("--max_val_stories", type=int, default=None, help="验证集条数上限（默认取所选数据集的推荐值）")  # 验证规模
     parser.add_argument("--vocab_size", type=int, default=8192, help="BPE 词表大小")  # 词表规模
     args = parser.parse_args()  # 解析命令行参数
+    spec = DATASETS[args.dataset]  # 所选数据集配置
+    max_train = args.max_train_stories if args.max_train_stories is not None else spec["default_train"]  # 训练条数（未指定用推荐值）
+    max_val = args.max_val_stories if args.max_val_stories is not None else spec["default_val"]  # 验证条数（未指定用推荐值）
 
-    train_path, val_path = download_corpus(args.max_train_stories, args.max_val_stories)  # 第一步：下载数据
+    train_path, val_path = download_corpus(max_train, max_val, args.dataset)  # 第一步：下载数据
     print("开始训练 BPE 分词器 ...")  # 第二步提示
     tok = train_tokenizer(train_path, args.vocab_size)  # 第二步：在训练语料上训分词器
     print(f"分词器词表大小: {tok.get_vocab_size()}")  # 打印实际词表大小
