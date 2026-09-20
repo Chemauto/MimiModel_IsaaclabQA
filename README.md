@@ -40,6 +40,26 @@ python sample.py --prompt "One day, a little dog" --max_new_tokens 500 --tempera
 | model.py | 极简 GPT 模型（嵌入 + 因果自注意力 + MLP，权重绑定） |
 | train.py | 预训练脚本（下一 token 预测，AdamW + 梯度裁剪） |
 | sample.py | 加载 checkpoint，按 temperature + top-k 采样续写 |
+| sft/prepare_sft.py | 下载 TinyStories-instruct，打包成「指令 → 故事」样本并生成损失掩码 |
+| sft/train_sft.py | SFT 后训练：从 out/model.pt 继续训练，只对故事部分计算损失，保存到 out/model_sft.pt |
+| sft/sample_sft.py | 加载 SFT 模型，按指令写故事 |
+
+## SFT 后训练（可选的第二阶段）
+
+在预训练完成后进行，让模型从「自由续写」变成「按指令写故事」。所有 SFT 脚本在 `sft/` 目录下，不修改任何预训练产物：权重只读 `out/model.pt`，结果另存 `out/model_sft.pt`。
+
+```bash
+python sft/prepare_sft.py --max_train_samples 50000 --max_val_samples 500   # 下载 instruct 数据并打包（依赖预训练阶段生成的 data/tokenizer.json）
+python sft/train_sft.py                                                     # 微调，GPU 上 1000 iter 约几分钟
+python sft/sample_sft.py --instructions "Write a short story about a little kitten who makes a new friend."
+```
+
+样本模板（提示部分不计算损失，只学习故事生成）：
+
+```text
+Instructions: <情节摘要 / 特征 / 词汇要求>
+Story: <故事><|endoftext|>
+```
 
 ## 超参数
 
